@@ -52,6 +52,7 @@
 #include <linux/uaccess.h>
 #include <asm/byteorder.h>
 #include <linux/moduleparam.h>
+#include <linux/pagemap.h>
 
 #include "usb.h"
 
@@ -94,6 +95,9 @@ struct async {
 	u32 secid;
 	u8 bulk_addr;
 	u8 bulk_status;
+
+	//set to 1, if the buffer is pinned user-memory
+	u8 is_user_mem;
 };
 
 static bool usbfs_snoop;
@@ -117,6 +121,12 @@ static unsigned usbfs_memory_mb = 16;
 module_param(usbfs_memory_mb, uint, 0644);
 MODULE_PARM_DESC(usbfs_memory_mb,
 		"maximum MB allowed for usbfs buffers (0 = no limit)");
+
+
+static bool usbfs_disable_zerocopy = false;
+module_param(usbfs_disable_zerocopy, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(usbfs_disable_zerocopy, "true to disable zerocopy and fallback to the old implementation");
+
 
 /* Hard limit, necessary to avoid arithmetic overflow */
 #define USBFS_XFER_MAX		(UINT_MAX / 2 - 1000000)
@@ -289,14 +299,23 @@ static struct async *alloc_async(unsigned int numisoframes)
 static void free_async(struct async *as)
 {
 	int i;
+	struct page* p;
 
 	put_pid(as->pid);
 	if (as->cred)
 		put_cred(as->cred);
+
 	for (i = 0; i < as->urb->num_sgs; i++) {
-		if (sg_page(&as->urb->sg[i]))
-			kfree(sg_virt(&as->urb->sg[i]));
+		p = sg_page(&as->urb->sg[i]);
+		if (p) {
+			if(as->is_user_mem) {
+				page_cache_release(p);
+			} else {
+				kfree(sg_virt(&as->urb->sg[i]));
+			}
+		}
 	}
+
 	kfree(as->urb->sg);
 	kfree(as->urb->transfer_buffer);
 	kfree(as->urb->setup_packet);
@@ -419,9 +438,11 @@ static void snoop_urb_data(struct urb *urb, unsigned len)
 	}
 }
 
-static int copy_urb_data_to_user(u8 __user *userbuffer, struct urb *urb)
+static int copy_urb_data_to_user(u8 __user *userbuffer, struct async *as)
 {
 	unsigned i, len, size;
+	struct urb *urb = as->urb;
+	struct page* page;
 
 	if (urb->number_of_packets > 0)		/* Isochronous */
 		len = urb->transfer_buffer_length;
@@ -434,12 +455,20 @@ static int copy_urb_data_to_user(u8 __user *userbuffer, struct urb *urb)
 		return 0;
 	}
 
-	for (i = 0; i < urb->num_sgs && len; i++) {
-		size = (len > USB_SG_SIZE) ? USB_SG_SIZE : len;
-		if (copy_to_user(userbuffer, sg_virt(&urb->sg[i]), size))
-			return -EFAULT;
-		userbuffer += size;
-		len -= size;
+	if(as->is_user_mem) {
+		for (i = 0; i < urb->num_sgs; i++) {
+			page = sg_page(&urb->sg[i]);
+			if (page)
+				set_page_dirty_lock(page);
+		}
+	} else {
+		for (i = 0; i < urb->num_sgs && len; i++) {
+			size = (len > USB_SG_SIZE) ? USB_SG_SIZE : len;
+			if (copy_to_user(userbuffer, sg_virt(&urb->sg[i]), size))
+				return -EFAULT;
+			userbuffer += size;
+			len -= size;
+		}
 	}
 
 	return 0;
@@ -1295,6 +1324,12 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
 	unsigned int stream_id = 0;
 	void *buf;
 
+	int num_pages = 0;
+	void *buf_aligned = 0; //the page aligned version of urb->buffer
+	int buf_offset = 0; // the offset nbetween urb->buffer and buf_alignment
+	int o;
+	struct page **pages = NULL;
+
 	if (uurb->flags & ~(USBDEVFS_URB_ISO_ASAP |
 				USBDEVFS_URB_SHORT_NOT_OK |
 				USBDEVFS_URB_BULK_CONTINUATION |
@@ -1370,9 +1405,21 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
 			uurb->type = USBDEVFS_URB_TYPE_INTERRUPT;
 			goto interrupt_urb;
 		}
-		num_sgs = DIV_ROUND_UP(uurb->buffer_length, USB_SG_SIZE);
-		if (num_sgs == 1 || num_sgs > ps->dev->bus->sg_tablesize)
-			num_sgs = 0;
+
+
+		buf_aligned = (char*)((unsigned long)uurb->buffer & PAGE_MASK);
+		buf_offset = uurb->buffer - buf_aligned;
+		if(uurb->buffer_length > 0)
+			num_pages = DIV_ROUND_UP(uurb->buffer_length + buf_offset, PAGE_SIZE);
+
+		if(usbfs_disable_zerocopy || num_pages > ps->dev->bus->sg_tablesize) {
+			num_pages = 0;
+
+			//fallback to the non-zerocopy path
+			num_sgs = DIV_ROUND_UP(uurb->buffer_length, USB_SG_SIZE);
+			if (num_sgs == 1 || num_sgs > ps->dev->bus->sg_tablesize)
+				num_sgs = 0;
+		}
 		if (ep->streams)
 			stream_id = uurb->stream_id;
 		break;
@@ -1436,8 +1483,14 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
 		goto error;
 	}
 
-	u += sizeof(struct async) + sizeof(struct urb) + uurb->buffer_length +
-	     num_sgs * sizeof(struct scatterlist);
+	u += sizeof(struct async) + sizeof(struct urb) +
+	     num_sgs * sizeof(struct scatterlist) +
+	     num_pages * sizeof(struct scatterlist);
+
+	//only add buffer_length if not doing zerocopy
+	if(!num_pages)
+		u += uurb->buffer_length;
+
 	ret = usbfs_increase_memory_usage(u);
 	if (ret)
 		goto error;
@@ -1472,6 +1525,57 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
 			}
 			totlen -= u;
 		}
+	} else if(num_pages) {
+		pages = kmalloc(num_pages*sizeof(struct page*), GFP_KERNEL);
+		if(!pages) {
+			ret = -ENOMEM;
+			goto error;
+		}
+
+		//create the scatterlist
+		as->urb->sg = kmalloc(num_pages * sizeof(struct scatterlist), GFP_KERNEL);
+		if (!as->urb->sg) {
+			ret = -ENOMEM;
+			goto error;
+		}
+
+		ret = get_user_pages_fast((unsigned long)buf_aligned,
+                   num_pages,
+                   is_in,
+                   pages);
+
+		if(ret < 0) {
+		    printk("get_user_pages failed %i\n", ret);
+		    goto error;
+		}
+
+		//did we get all pages?
+		if(ret < num_pages) {
+		    printk("get_user_pages didn't deliver all pages %i\n", ret);
+			//free the pages and error out
+			for(i=0; i<ret; i++) {
+				page_cache_release(pages[i]);
+			}
+			ret = -ENOMEM;
+			goto error;
+		}
+
+		as->is_user_mem = 1;
+		as->urb->num_sgs = num_pages;
+		sg_init_table(as->urb->sg, as->urb->num_sgs);
+
+		totlen = uurb->buffer_length + buf_offset;
+		o = buf_offset;
+		for (i = 0; i < as->urb->num_sgs; i++) {
+			u = (totlen > PAGE_SIZE) ? PAGE_SIZE : totlen;
+			u-= o;
+			sg_set_page(&as->urb->sg[i], pages[i], u, o);
+			totlen -= u + o;
+			o = 0;
+		}
+
+		kfree(pages);
+		pages = NULL;
 	} else if (uurb->buffer_length > 0) {
 		as->urb->transfer_buffer = kmalloc(uurb->buffer_length,
 				GFP_KERNEL);
@@ -1603,6 +1707,7 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
  error:
 	kfree(isopkt);
 	kfree(dr);
+	kfree(pages);
 	if (as)
 		free_async(as);
 	return ret;
@@ -1651,7 +1756,7 @@ static int processcompl(struct async *as, void __user * __user *arg)
 	unsigned int i;
 
 	if (as->userbuffer && urb->actual_length) {
-		if (copy_urb_data_to_user(as->userbuffer, urb))
+		if (copy_urb_data_to_user(as->userbuffer, as))
 			goto err_out;
 	}
 	if (put_user(as->status, &userurb->status))
@@ -1820,7 +1925,7 @@ static int processcompl_compat(struct async *as, void __user * __user *arg)
 	unsigned int i;
 
 	if (as->userbuffer && urb->actual_length) {
-		if (copy_urb_data_to_user(as->userbuffer, urb))
+		if (copy_urb_data_to_user(as->userbuffer, as))
 			return -EFAULT;
 	}
 	if (put_user(as->status, &userurb->status))
